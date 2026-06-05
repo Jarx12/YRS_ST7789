@@ -1,0 +1,25 @@
+GPIO 5 (MISO)     - HW503 BLUE (A0)	5V           -		
+GPIO 6 (MOSI)     - NONE		GND          -	
+GPIO 7 (SS)       - SPI2 GREEN (CS)	3V3          - 
+GPIO 8 (SDA) LED  - NONE		GPIO 4 (SCK) - SPI1 GREEN (SCL)
+GPIO 9 (SCL) BOOT - NONE		GPIO 3       - SPI1 RED (SDA)
+GPIO 10           - SPI2 BLACK (RESET)	GPIO 2       - SPI2 RED (BLK)
+GPIO 20 (RX)      - NONE 		GPIO 1       - SPI2 BLUE (DC)
+GPIO 21 (TX)      - NONE		GPIO 0       - VD 3.3V -> R1 47kΩ R2 Termistor 50kΩ
+
+
+PINOUT HW503
+3.3v -> ROJO
+A0   -> AZUL
+GND  -> NEGRO
+D0   -> VERDE
+ 
+PINOUT SPI
+GND -> SPI1 BLACK
+VCC -> SPI1 BLUE
+SCL -> SPI1 GREEN
+SDA -> SPI1 RED
+RES -> SPI2 BLACK
+DC  -> SPI2 BLUE
+CS  -> SPI2 GREEN
+BLK -> SPI2 RED
