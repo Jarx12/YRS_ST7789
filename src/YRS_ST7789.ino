@@ -59,7 +59,7 @@ void updateDisplay() {
     // Dynamic Color for Motor
     uint16_t motorColor = TFT_CYAN;
     if (ValoresMotor.temperature >= 94 && ValoresMotor.temperature < 105)  motorColor = TFT_YELLOW;
-    if (ValoresMotor.temperature >= 105) motorColor = TFT_RED;
+    if (ValoresMotor.temperature >= 105) motorColor = TFT_ORANGE;
     img.setTextColor(motorColor, TFT_BLACK);
     // Draw Large Temp
     img.setFreeFont(&FreeSansBold24pt7b);
@@ -100,7 +100,7 @@ void updateDisplay() {
         img.drawString("ESTATUS: CALENTADO", 160, 160); // 160 is horizontal center
     }
     else {
-        img.setTextColor(TFT_RED, TFT_BLACK);
+        img.setTextColor(TFT_ORANGE, TFT_BLACK);
         img.drawString("ESTATUS: SOBRECALENTADO", 160, 160);
     }
     
@@ -117,7 +117,7 @@ void drawTemperatureBar(int temp, int x, int y, int w, int h) {
     // 3. Determine color based on temperature
     uint16_t barColor = TFT_GREEN;
     if (safeTemp >= 94 && safeTemp < 105)  barColor = TFT_YELLOW;
-    if (safeTemp >= 105) barColor = TFT_RED;
+    if (safeTemp >= 105) barColor = TFT_ORANGE;
     
     // 4. Draw the Gauge Frame (The "Empty" Part)
     img.drawRect(x, y, w, h, TFT_DARKGREY); 
