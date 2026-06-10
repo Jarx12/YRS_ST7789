@@ -31,7 +31,7 @@ void setup() {
     delay(60);
     tft.drawString("Iniciando Monitor!", 10, 90, 2);
     delay(500);
-    analogWrite(TFT_BL, 40); // 60% Brightness
+    analogWrite(TFT_BL, 50); // 70% Brightness
     tft.fillScreen(TFT_BLACK); 
     img.createSprite(320, 172);
     
@@ -90,11 +90,11 @@ void updateDisplay() {
     img.setFreeFont(&FreeSansBold9pt7b);
     
     drawTemperatureBar(ValoresMotor.temperature, 20, 105, 280, 15);
-    if (ValoresMotor.temperature < 94) {
+    if (ValoresMotor.temperature < 95) {
         img.setTextColor(TFT_GREEN, TFT_BLACK);
         img.drawString("ESTATUS: NORMAL", 160, 160); // 160 is horizontal center
     } 
-    else if (ValoresMotor.temperature >= 94 && ValoresMotor.temperature < 105) 
+    else if (ValoresMotor.temperature >= 95 && ValoresMotor.temperature < 105) 
     {
         img.setTextColor(TFT_YELLOW, TFT_BLACK);
         img.drawString("ESTATUS: CALENTADO", 160, 160); // 160 is horizontal center
@@ -116,7 +116,7 @@ void drawTemperatureBar(int temp, int x, int y, int w, int h) {
     
     // 3. Determine color based on temperature
     uint16_t barColor = TFT_GREEN;
-    if (safeTemp >= 94 && safeTemp < 105)  barColor = TFT_YELLOW;
+    if (safeTemp >= 95 && safeTemp < 105)  barColor = TFT_YELLOW;
     if (safeTemp >= 105) barColor = TFT_ORANGE;
     
     // 4. Draw the Gauge Frame (The "Empty" Part)
