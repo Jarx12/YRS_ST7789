@@ -41,7 +41,7 @@ void setup() {
 void loop() 
 {
     updateDisplay();
-    delay(200);
+    delay(100);
     if (flash_alert_flag)
         alert_in_display();
 }
@@ -60,8 +60,12 @@ void alert_in_display()
 void updateDisplay() {
     SensorData ValoresMotor = leer_termistor_motor();
     SensorData ValoresAC = leer_termistor_ac(); 
-    if (ValoresMotor.temperature > 105)
+    const int temp_threshold_warn = 95;
+    const int temp_threshold_overheat = 105;
+
+    if (ValoresMotor.temperature > temp_threshold_overheat)
         flash_alert_flag=true;
+
     img.fillSprite(TFT_BLACK);
 
     // --- LEFT COLUMN (MOTOR) ---
@@ -75,8 +79,8 @@ void updateDisplay() {
     img.drawFloat(ValoresAC.resistance,0,290,160);
     // Dynamic Color for Motor
     uint16_t motorColor = TFT_CYAN;
-    if (ValoresMotor.temperature >= 94 && ValoresMotor.temperature < 105)  motorColor = TFT_YELLOW;
-    if (ValoresMotor.temperature >= 105) motorColor = TFT_ORANGE;
+    if (ValoresMotor.temperature >= temp_threshold_warn && ValoresMotor.temperature < temp_threshold_overheat)  motorColor = TFT_YELLOW;
+    if (ValoresMotor.temperature >= temp_threshold_overheat) motorColor = TFT_ORANGE;
     img.setTextColor(motorColor, TFT_BLACK);
     // Draw Large Temp
     img.setFreeFont(&FreeSansBold24pt7b);
@@ -107,11 +111,11 @@ void updateDisplay() {
     img.setFreeFont(&FreeSansBold9pt7b);
     
     drawTemperatureBar(ValoresMotor.temperature, 20, 105, 280, 15);
-    if (ValoresMotor.temperature < 95) {
+    if (ValoresMotor.temperature < temp_threshold_warn) {
         img.setTextColor(TFT_GREEN, TFT_BLACK);
         img.drawString("ESTATUS: NORMAL", 160, 160); // 160 is horizontal center
     } 
-    else if (ValoresMotor.temperature >= 95 && ValoresMotor.temperature < 105) 
+    else if (ValoresMotor.temperature >= temp_threshold_warn && ValoresMotor.temperature < temp_threshold_overheat) 
     {
         img.setTextColor(TFT_YELLOW, TFT_BLACK);
         img.drawString("ESTATUS: CALENTADO", 160, 160); // 160 is horizontal center
@@ -164,38 +168,46 @@ SensorData leer_termistor_ac()
     int R1 = 20000; 
     int R2 = 150;
     int R_pullup_board = 10000; // Resistor de 10k fisico en GPIO 2 
-    float R_eff = 1.0 / ((1.0 / (R1+R2)) + (1.0 / R_pullup_board));
-    float R3_sum = 0;
-    //float Vout_avg = 0;
+    const float R_eff = 1.0f / ((1.0f / (R1 + R2)) + (1.0f / (float)R_pullup_board));
+
     // Coeficientes de Steinhart-Hart                                                                 
     float Lnr = 0;
     float InvT = 0;
     float A = 2.725132873e-3, B = -0.3077755504e-4, C = 11.79553855e-7;
+    
+    const int offset_calibracion = 0;
+    const float alpha = 0.40; // Alpha de 0.40 para reaccionar rápido
+    static float Vout_filtrado = -1.0f; 
 
-    const int num_muestras = 32;
-    for (int x = 0; x < num_muestras; x++)
-    { 
-        int Vout_raw = analogReadMilliVolts(2); 
-        //Vout_avg += Vout_raw;
-        // Calculation for R3 based on the formula: Vout = Vin * (R3 / (R1 + R2 + R3))
-        // R3 = (Vout * R_eff) / (Vin - Vout)
-        R3_sum += (Vout_raw * (R_eff)) / (Vin - Vout_raw);
+    // 1. Tomar una muestra instantánea de voltaje
+    int Vout_raw = analogReadMilliVolts(2) - offset_calibracion; 
+    // Validacion: Evitar cortocircuitos o cables sueltos que causen división por cero
+    if (Vout_raw <= 0 || Vout_raw >= Vin) 
+    {
+        return datosAC; // Retorna -1 si la lectura física es fallida o fuera de rango, evitando cálculos erróneos
     }
-    //Vout_avg /= num_muestras;
-    float R3_final = R3_sum / num_muestras;
+    // 2. Inicializar el filtro en el primer ciclo del programa
+    if (Vout_filtrado < 0) 
+    {
+        Vout_filtrado = (float)Vout_raw;
+    }
+    // 3. Aplicar el filtro digital al voltaje
+    Vout_filtrado = (alpha * (float)Vout_raw) + ((1.0f - alpha) * Vout_filtrado);
+    // 4. Calcular R3 utilizando el voltaje ya filtrado y libre de ruido eléctrico
+    // R3 = (Vout * R_eff) / (Vin - Vout)
+    float R3_final = (Vout_filtrado * R_eff) / ((float)Vin - Vout_filtrado);
     datosAC.resistance = R3_final;
-
+    // 5. Aplicar la ecuación de Steinhart-Hart
     if (R3_final > 0) 
     {
         Lnr = logf(R3_final);
         InvT = A + (B * Lnr) + (C * Lnr * Lnr * Lnr);
-        datosAC.temperature = (1.0 / InvT) - 273.15;
+        datosAC.temperature = (1.0f / InvT) - 273.15f;
     } 
-
-    // --- Serial Output ---
-    //Serial.print("VOUT(avg): "); Serial.print(Vout_avg); Serial.print(" mV | ");
-    //Serial.print("R3: "); Serial.print(datosAC.resistance); Serial.print(" ohms | ");
-    //Serial.print("Temp: "); Serial.print(datosAC.temperature); Serial.println(" °C");
+    // --- Serial Output para Debug ---
+    // Serial.print("VOUT_Filt: "); Serial.print(Vout_filtrado); Serial.print(" mV | ");
+    // Serial.print("R3: "); Serial.print(datosAC.resistance); Serial.print(" ohms | ");
+    // Serial.print("Temp: "); Serial.print(datosAC.temperature); Serial.println(" °C");
     
     return datosAC;
 }
@@ -212,19 +224,32 @@ SensorData leer_termistor_motor() {
     float Lnr=0;
     float InvT=0;
     float A = 0.2276068653e-3, B = 3.085959593e-4, C = -1.752477535893581e-7;
-    const int num_muestras = 32;
-    const int offset_calibracion = 0; //Offset de calibracion para el ADC
-    for (int x = 0; x < num_muestras; x++)
-    { //Numero de muestras
-        int Vout = analogReadMilliVolts(0) - offset_calibracion; // Lee el voltaje en milivoltios
-        R2 += ((Vout * R1) / (Vin-Vout)); //R2 despejada del Divisor de Voltaje VOUT = VIN * (R2/(R1+R2))        
+    const int offset_calibracion = 0;
+    const float alpha = 0.15; // Factor de suavizado (entre 0.01 y 1.0). Menor = más filtrado.
+    static float Vout_filtrado = -1.0; //Static para que conserve su valor entre llamadas y permita el filtrado digital low-pass
+
+    // 1. Leer la muestra instantánea actual
+    int Vout_inst = analogReadMilliVolts(0) - offset_calibracion;
+    // Validacion: Evitar divisiones por cero o valores absurdos antes de filtrar
+    if (Vout_inst <= 0 || Vout_inst >= Vin) {
+        return datosMotor; // Devuelve -1 si hay un fallo de lectura
     }
-    R2 /= num_muestras; //Valor promedio de las muestras
-    datosMotor.resistance=R2;
+    // 2. Inicializar el filtro en el primer arranque para evitar transitorios desde cero
+    if (Vout_filtrado < 0) {
+        Vout_filtrado = (float)Vout_inst;
+    }
+    // 3. Aplicar la ecuación del filtro digital low-pass
+    Vout_filtrado = (alpha * Vout_inst) + ((1.0f - alpha) * Vout_filtrado);
+    // 4. Calcular la resistencia R2 basándonos en el voltaje ya filtrado
+    long R2 = (long)((Vout_filtrado * R1) / (Vin - Vout_filtrado));
+    datosMotor.resistance = R2;
+    // 5. Ecuación Steinhart-Hart
     if (R2 > 0) {
-        Lnr = logf(R2);
-        InvT = A + B * Lnr + C * Lnr*Lnr*Lnr;
-        datosMotor.temperature=(1 / InvT) - 273.15 + 3; //Inv T es el inverso de la temperatura en Kelvin la cual convertimos a Celsius usando C = T - 273,15, sumamos 3 por un factor de calibracion no contemplado
+        float Lnr = logf((float)R2);
+        float InvT = A + B * Lnr + C * Lnr * Lnr * Lnr;
+        
+        // Conversión a Celsius y ajuste por calibración (+3)
+        datosMotor.temperature = (1.0f / InvT) - 273.15f + 3.0f;
     } 
     return datosMotor;
 }
