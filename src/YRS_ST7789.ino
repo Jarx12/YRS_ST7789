@@ -241,7 +241,7 @@ SensorData leer_termistor_motor() {
     // 3. Aplicar la ecuación del filtro digital low-pass
     Vout_filtrado = (alpha * Vout_inst) + ((1.0f - alpha) * Vout_filtrado);
     // 4. Calcular la resistencia R2 basándonos en el voltaje ya filtrado
-    long R2 = (long)((Vout_filtrado * R1) / (Vin - Vout_filtrado));
+    R2 = (long)((Vout_filtrado * R1) / (Vin - Vout_filtrado));
     datosMotor.resistance = R2;
     // 5. Ecuación Steinhart-Hart
     if (R2 > 0) {
