@@ -5,6 +5,8 @@
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite img = TFT_eSprite(&tft); // Create the Sprite object
 
+bool flash_alert_flag=false;
+
 struct SensorData {
     long temperature;
     long resistance;
@@ -19,19 +21,19 @@ void setup() {
     tft.fillScreen(TFT_BLACK); 
     tft.setTextColor(TFT_WHITE);
     tft.drawString("Kernel C3 Estable!", 10, 30, 2);
-    delay(60);
+    delay(30);
     tft.drawString("LCD Inicializado!", 10, 45, 2);
     analogSetAttenuation(ADC_11db); // Esto permite leer hasta ~3.1V - 3.3V
-    delay(60);
+    delay(50);
     tft.drawString("ADC Atenuado a 11dB!", 10, 60, 2);
     pinMode(0, ANALOG);
     pinMode(2, ANALOG);
-    delay(60);
+    delay(50);
     tft.drawString("GPIO 0 y 2 configurados como ANALOG!", 10, 75, 2);
-    delay(60);
+    delay(50);
     tft.drawString("Iniciando Monitor!", 10, 90, 2);
-    delay(500);
-    analogWrite(TFT_BL, 50); // 70% Brightness
+    delay(300);
+    analogWrite(TFT_BL, 45); // 70% Brightness
     tft.fillScreen(TFT_BLACK); 
     img.createSprite(320, 172);
     
@@ -40,11 +42,26 @@ void loop()
 {
     updateDisplay();
     delay(200);
+    if (flash_alert_flag)
+        alert_in_display();
+}
+
+void alert_in_display()
+{
+    flash_alert_flag=false;
+    img.fillSprite(TFT_RED);
+    img.setFreeFont(&FreeSans12pt7b);
+    img.setTextColor(TFT_WHITE, TFT_BLACK);
+    img.drawString("RECALENTANDO", 160, 90);
+    img.pushSprite(0, 0);
+    delay(200); 
 }
 
 void updateDisplay() {
     SensorData ValoresMotor = leer_termistor_motor();
     SensorData ValoresAC = leer_termistor_ac(); 
+    if (ValoresMotor.temperature > 105)
+        flash_alert_flag=true;
     img.fillSprite(TFT_BLACK);
 
     // --- LEFT COLUMN (MOTOR) ---
