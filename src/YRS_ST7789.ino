@@ -17,7 +17,7 @@ struct SensorData {
 
 class TrendTracker {
 private:
-    static const int BUFFER_SIZE = 20;
+    static const int BUFFER_SIZE = 25; // Enough for 3.5s at 100ms intervals
     float temp_history[BUFFER_SIZE];
     unsigned long time_history[BUFFER_SIZE];
     int head = 0;
@@ -118,7 +118,7 @@ void alert_in_display()
     img.setTextColor(TFT_WHITE, TFT_BLACK);
     img.drawString("RECALENTANDO", 160, 90);
     img.pushSprite(0, 0);
-    delay(200); 
+    delay(250); 
 }
 
 // Helper function to format resistance cleanly (e.g., 46850 -> "46.8k ohm" or "850 ohm")
@@ -158,7 +158,7 @@ void updateDisplay() {
     img.drawString("MOTOR", leftCenterX + 10, 4);
     drawTrendIndicator(ValoresMotor.trend, 18, 4, 14, TFT_WHITE);
 
-    // Motor Temperature Number (Using 18pt font to fit comfortably)
+    // Motor Temperature Number
     uint16_t motorColor = TFT_CYAN;
     if (ValoresMotor.temperature >= temp_threshold_warn && ValoresMotor.temperature < temp_threshold_overheat) 
         motorColor = TFT_YELLOW;
@@ -174,9 +174,9 @@ void updateDisplay() {
     img.setTextDatum(TL_DATUM);
     img.drawString("C", leftCenterX + 24, 22); 
 
-    // Motor Resistance (Now using 9pt font directly under temp!)
+    // Motor Resistance
     img.setTextDatum(TC_DATUM);
-    img.setTextColor(TFT_SILVER, TFT_BLACK);
+    img.setTextColor(TFT_WHITE, TFT_BLACK);
     img.drawString(formatResistance(ValoresMotor.resistance), leftCenterX, 58);
 
 
@@ -200,15 +200,15 @@ void updateDisplay() {
     img.setTextDatum(TL_DATUM);
     img.drawString("C", rightCenterX + 24, 22);
 
-    // A/C Resistance (Now using 9pt font directly under temp!)
+    // A/C Resistance
     img.setTextDatum(TC_DATUM);
-    img.setTextColor(TFT_SILVER, TFT_BLACK);
+    img.setTextColor(TFT_WHITE, TFT_BLACK);
     img.drawString(formatResistance(ValoresAC.resistance), rightCenterX, 58);
 
 
     // ==================== 4. TEMPERATURE BAR ====================
-    // Positioned cleanly in the middle (Y = 88, Height = 16)
-    drawTemperatureBar((int)ValoresMotor.temperature, 20, 88, 280, 16);
+    // Positioned cleanly in the middle (Y = 86, Height = 12)
+    drawTemperatureBar((int)ValoresMotor.temperature, 20, 86, 280, 12);
 
 
     // ==================== 5. BOTTOM STATUS BANNER ====================
@@ -332,7 +332,7 @@ SensorData leer_termistor_ac()
     SensorData datosAC;
     datosAC.resistance = -1;
     datosAC.temperature = -1;
-    static TrendTracker batteryTrendTracker(3500, 0.50f);  // 5s window, less sensitive
+    static TrendTracker ACTrendTracker(3500, 0.60f);  // 3.5s window, 0.60°C threshold for trend detection
     // Valores Conocidos
     int Vin = 3329; 
     int R1 = 20000; 
@@ -378,7 +378,7 @@ SensorData leer_termistor_ac()
     // Serial.print("VOUT_Filt: "); Serial.print(Vout_filtrado); Serial.print(" mV | ");
     // Serial.print("R3: "); Serial.print(datosAC.resistance); Serial.print(" ohms | ");
     // Serial.print("Temp: "); Serial.print(datosAC.temperature); Serial.println(" °C");
-    
+    ACTrendTracker.update(datosAC.temperature, datosAC.trend, datosAC.temp_change_3s);
     return datosAC;
 }
 
@@ -387,7 +387,7 @@ SensorData leer_termistor_motor()
     SensorData datosMotor;
     datosMotor.resistance=-1;
     datosMotor.temperature=-1;
-    static TrendTracker motorTrendTracker(3500, 0.25f); ///3.5s window 0.25°C threshold for trend detection
+    static TrendTracker motorTrendTracker(3500, 0.60f); ///3.5s window 0.60°C threshold for trend detection
     //Ecuacion Steinhart-Hart: 1/T = A + B * (ln(R)) + C(ln(R)^3 (Donde R es la Resistencia en Ohmios del Termisor(R2) y T la temperatura en Kelvin)   
     //Valores Conocidos
     const int Vin = 3329; const int R1 = 46850; long R2 = 0;
