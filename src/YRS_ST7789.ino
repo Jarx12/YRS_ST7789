@@ -5,7 +5,29 @@
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite img = TFT_eSprite(&tft); // Create the Sprite object
 
-bool flash_alert_flag=false;
+bool overheat_alert_active = false;
+unsigned long last_display_update = 0;
+
+const int TEMP_WARNING = 95;
+const int TEMP_ALERT = 110;
+const int TEMP_ALERT_CLEAR = 105;
+const unsigned long DISPLAY_PERIOD_MS = 100;
+// Minimum temperature change over the trend window to be treated as a real rise/fall.
+// Shared by the TrendTracker instances and the trend text so they can never disagree:
+// anything inside this band is sensor noise and is reported as steady.
+const float TREND_NOISE_THRESHOLD = 0.60f; // degrees C
+
+// ==================== DASHBOARD LAYOUT (320x172 landscape) ====================
+// The bottom half of the screen, top to bottom: gauge bar, trend strip, status
+// badge. These are named constants because the bands have to be tuned against
+// each other - the numbers below leave an empty gap of 5-7px between any two of
+// them, which is what stopped the title/delta collision in the first place.
+const int GAUGE_X = 20, GAUGE_Y = 86, GAUGE_W = 280, GAUGE_H = 12;
+const int TREND_X = 20, TREND_Y = 106, TREND_W = 280, TREND_H = 26;
+const int BADGE_X = 20, BADGE_Y = 138, BADGE_W = 280, BADGE_H = 28;
+const uint16_t TREND_BG = 0x0841;   // near black, just lifts the band off the screen
+const uint16_t TREND_LINE = 0x4208; // same dim grey as the existing dividers
+
 enum TempTrend { ESTABLE = 0, SUBIENDO = 1, BAJANDO = -1 };
 
 struct SensorData {
@@ -13,11 +35,12 @@ struct SensorData {
     long resistance;
     float temp_change_3s;
     TempTrend trend;
+    bool valid;
   };
 
 class TrendTracker {
 private:
-    static const int BUFFER_SIZE = 25; // Enough for 3.5s at 100ms intervals
+    static const int BUFFER_SIZE = 32; // Covers a 3s window at 100ms intervals
     float temp_history[BUFFER_SIZE];
     unsigned long time_history[BUFFER_SIZE];
     int head = 0;
@@ -27,7 +50,7 @@ private:
 
 public:
     // Constructor: customize window time and sensitivity per instance
-    TrendTracker(unsigned long window_ms = 3500, float noise_threshold = 0.25f) 
+    TrendTracker(unsigned long window_ms = 3000, float noise_threshold = 0.25f)
         : window_ms(window_ms), noise_threshold(noise_threshold) {}
 
     void update(float current_temp, TempTrend &trend_out, float &delta_out) 
@@ -38,7 +61,7 @@ public:
         temp_history[head] = current_temp;
         time_history[head] = now;
 
-        // 2. Find sample closest to window_ms ago
+        // 2. Find the oldest sample that is at least one window old
         int oldest_idx = head;
         int sample_count = buffer_filled ? BUFFER_SIZE : (head + 1);
 
@@ -78,101 +101,156 @@ public:
 
 
 void setup() {
-    //Serial.begin(115200);
-    delay(50);
     tft.init();
     tft.setRotation(1); // Landscape 320x172
-    tft.fillScreen(TFT_BLACK); 
-    tft.setTextColor(TFT_WHITE);
-    tft.drawString("Kernel C3 Estable!", 10, 30, 2);
-    delay(30);
-    tft.drawString("LCD Inicializado!", 10, 45, 2);
+    tft.fillScreen(TFT_BLACK);
     analogSetAttenuation(ADC_11db); // Esto permite leer hasta ~3.1V - 3.3V
-    delay(50);
-    tft.drawString("ADC Atenuado a 11dB!", 10, 60, 2);
     pinMode(0, ANALOG);
     pinMode(2, ANALOG);
-    delay(50);
-    tft.drawString("GPIO 0 y 2 configurados como ANALOG!", 10, 75, 2);
-    delay(50);
-    tft.drawString("Iniciando Monitor!", 10, 90, 2);
-    delay(300);
-    analogWrite(TFT_BL, 45); // 70% Brightness
-    tft.fillScreen(TFT_BLACK); 
-    img.createSprite(320, 172);
-    
-}
-void loop() 
-{
-    updateDisplay();
-    delay(100);
-    if (flash_alert_flag)
-        alert_in_display();
+    analogWrite(TFT_BL, 70); // 70% Brightness
+    tft.fillScreen(TFT_BLACK);
+    if (img.createSprite(320, 172) == nullptr) {
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE);
+        tft.drawString("LCD INIT ERROR", 160, 86, 2);
+        while (true) {
+            delay(1000);
+        }
+    }
 }
 
-void alert_in_display()
+void loop()
 {
-    flash_alert_flag=false;
-    img.fillSprite(TFT_RED);
-    img.setFreeFont(&FreeSans12pt7b);
-    img.setTextColor(TFT_WHITE, TFT_BLACK);
-    img.drawString("RECALENTANDO", 160, 90);
+    unsigned long now = millis();
+    if (now - last_display_update >= DISPLAY_PERIOD_MS) {
+        last_display_update = now;
+        updateDisplay();
+    }
+}
+
+void alert_in_display(const SensorData &motor, bool sensorFault)
+{
+    uint16_t bg = sensorFault ? TFT_DARKGREY : TFT_RED;
+    img.fillSprite(bg);
+    img.setTextColor(TFT_WHITE, bg);
+
+    // --- Title ---
+    img.setTextDatum(MC_DATUM);
+    img.setFreeFont(&FreeSansBold12pt7b);
+    img.drawString(sensorFault ? "SENSOR ERROR" : "RECALENTADO", 160, 30);
+
+    // A failed reading has no trustworthy temperature, trend or bar to show,
+    // and the engine may still be genuinely overheating off the last good sample.
+    if (sensorFault || !motor.valid) {
+        img.setFreeFont(&FreeSansBold9pt7b);
+        img.drawString("LECTURA INVALIDA", 160, 120);
+        img.pushSprite(0, 0);
+        return;
+    }
+
+    // --- Current engine temperature (same offset trick as the dashboard) ---
+    img.setTextDatum(TC_DATUM);
+    img.setFreeFont(&FreeSansBold18pt7b);
+    img.drawNumber((int)motor.temperature, 145, 95);
+
+    img.setFreeFont(&FreeSans9pt7b);
+    img.setTextDatum(TL_DATUM);
+    img.drawString("C", 169, 95);
+
+    // --- Climbing, falling or steady? ---
+    drawTrendIndicator(motor.trend, 192, 84, 22, TFT_WHITE);
+
+    img.setTextDatum(MC_DATUM);
+    img.setFreeFont(&FreeSansBold9pt7b);
+    img.drawString(formatTrendDelta(motor), 160, 128);
+
+    // --- How close to the limit ---
+    drawTemperatureBar((int)motor.temperature, 40, 148, 240, 10);
+
     img.pushSprite(0, 0);
-    delay(250); 
 }
 
 // Helper function to format resistance cleanly (e.g., 46850 -> "46.8k ohm" or "850 ohm")
 String formatResistance(long r) {
-    if (r < 0) return "ERROR";
+    if (r < 0) return "SENSOR ERROR";
     if (r >= 10000) {
         return String(r / 1000.0f, 1) + "k ohm"; // e.g. 46.8k ohm
     }
     return String(r) + " ohm";                   // e.g. 850 ohm
 }
 
+String formatTrendDelta(const SensorData &data) {
+    if (!data.valid) return "ERR";
+    // The TrendTracker already rejects anything below TREND_NOISE_THRESHOLD, so
+    // only print a number while the engine is genuinely moving. The old +/-0.05
+    // dead-band let sensor noise through and made this flicker between "+0.1",
+    // "+0.2" and "0.0" while nothing was actually happening.
+    if (data.trend == ESTABLE) return "0.0";
+
+    String result = String(data.temp_change_3s, 1);
+    if (data.temp_change_3s > 0) {
+        result = String("+") + result;
+    }
+    return result;
+}
+
 void updateDisplay() {
     SensorData ValoresMotor = leer_termistor_motor();
-    SensorData ValoresAC = leer_termistor_ac(); 
-    const int temp_threshold_warn = 95;
-    const int temp_threshold_overheat = 105;
+    SensorData ValoresAC = leer_termistor_ac();
 
-    if (ValoresMotor.temperature > temp_threshold_overheat)
-        flash_alert_flag = true;
+    // The engine alert is latched at 110 C and clears at 105 C.
+    if (ValoresMotor.valid) {
+        if (!overheat_alert_active && ValoresMotor.temperature >= TEMP_ALERT) {
+            overheat_alert_active = true;
+        } else if (overheat_alert_active && ValoresMotor.temperature <= TEMP_ALERT_CLEAR) {
+            overheat_alert_active = false;
+        }
+    }
+
+    // A failed engine sensor takes priority over the normal dashboard.
+    // An invalid reading never clears a previously latched overheat alert.
+    if (!ValoresMotor.valid || overheat_alert_active) {
+        alert_in_display(ValoresMotor, !ValoresMotor.valid);
+        return;
+    }
 
     img.fillSprite(TFT_BLACK);
 
     // ==================== 1. DIVIDERS & GRID ====================
-    // Vertical line separating Motor & A/C columns
-    img.drawFastVLine(160, 0, 78, TFT_DARKGREY); 
+    // Vertical line separating Motor & A/C columns. It stops at the gauge bar;
+    // inside the trend strip below, the divider is redrawn in the strip colour.
+    img.drawFastVLine(160, 0, 80, TFT_DARKGREY);
     // Horizontal divider separating sensor columns from the gauge bar
-    img.drawFastHLine(10, 80, 300, 0x4208); 
-
+    img.drawFastHLine(10, 80, 300, 0x4208);
 
     // ==================== 2. LEFT COLUMN (MOTOR) ====================
     uint16_t leftCenterX = 80;
-    
-    // Header: "MOTOR" + Trend Arrow
-    img.setTextDatum(TC_DATUM);
+
+    // Header: channel name only. The trend arrow and its 3s delta now live in
+    // the trend strip between the gauge and the badge, so the title is free to
+    // be centred in its column and can never touch a neighbouring glyph.
+    // With MC_DATUM a FreeSansBold9pt7b line occupies rows y-6 .. y+7.
+    img.setTextDatum(MC_DATUM);
     img.setTextColor(TFT_WHITE, TFT_BLACK);
     img.setFreeFont(&FreeSansBold9pt7b);
-    img.drawString("MOTOR", leftCenterX + 10, 4);
-    drawTrendIndicator(ValoresMotor.trend, 18, 4, 14, TFT_WHITE);
+    img.drawString("MOTOR", leftCenterX, 10);
 
     // Motor Temperature Number
     uint16_t motorColor = TFT_CYAN;
-    if (ValoresMotor.temperature >= temp_threshold_warn && ValoresMotor.temperature < temp_threshold_overheat) 
+    if (ValoresMotor.temperature >= TEMP_WARNING && ValoresMotor.temperature < TEMP_ALERT)
         motorColor = TFT_YELLOW;
-    if (ValoresMotor.temperature >= temp_threshold_overheat) 
+    if (ValoresMotor.temperature >= TEMP_ALERT)
         motorColor = TFT_ORANGE;
 
+    img.setTextDatum(TC_DATUM);
     img.setTextColor(motorColor, TFT_BLACK);
     img.setFreeFont(&FreeSansBold18pt7b);
-    img.drawNumber((int)ValoresMotor.temperature, leftCenterX - 10, 22); 
+    img.drawNumber((int)ValoresMotor.temperature, leftCenterX - 10, 22);
 
     // Unit '°C'
     img.setFreeFont(&FreeSans9pt7b);
     img.setTextDatum(TL_DATUM);
-    img.drawString("C", leftCenterX + 24, 22); 
+    img.drawString("C", leftCenterX + 24, 22);
 
     // Motor Resistance
     img.setTextDatum(TC_DATUM);
@@ -183,60 +261,75 @@ void updateDisplay() {
     // ==================== 3. RIGHT COLUMN (A/C) ====================
     uint16_t rightCenterX = 240;
 
-    // Header: "A/C" + Trend Arrow
-    img.setTextDatum(TC_DATUM);
+    // Header: "A/C" only - see the MOTOR header note above for the rationale.
+    img.setTextDatum(MC_DATUM);
     img.setTextColor(TFT_WHITE, TFT_BLACK);
     img.setFreeFont(&FreeSansBold9pt7b);
-    img.drawString("A/C", rightCenterX + 10, 4);
-    drawTrendIndicator(ValoresAC.trend, 178, 4, 14, TFT_WHITE);
+    img.drawString("A/C", rightCenterX, 10);
 
     // A/C Temperature Number
-    img.setTextColor(TFT_GREEN, TFT_BLACK);
-    img.setFreeFont(&FreeSansBold18pt7b);
-    img.drawNumber((int)ValoresAC.temperature, rightCenterX - 10, 22);
+    img.setTextDatum(TC_DATUM);
+    if (ValoresAC.valid) {
+        img.setTextColor(TFT_GREEN, TFT_BLACK);
+        img.setFreeFont(&FreeSansBold18pt7b);
+        img.drawNumber((int)ValoresAC.temperature, rightCenterX - 10, 22);
 
-    // Unit '°C'
-    img.setFreeFont(&FreeSans9pt7b);
-    img.setTextDatum(TL_DATUM);
-    img.drawString("C", rightCenterX + 24, 22);
+        // Unit '°C'
+        img.setFreeFont(&FreeSans9pt7b);
+        img.setTextDatum(TL_DATUM);
+        img.drawString("C", rightCenterX + 24, 22);
+    } else {
+        img.setTextColor(TFT_RED, TFT_BLACK);
+        img.setFreeFont(&FreeSansBold9pt7b);
+        img.setTextDatum(TC_DATUM);
+        img.drawString("ERROR", rightCenterX, 22);
+    }
 
     // A/C Resistance
     img.setTextDatum(TC_DATUM);
-    img.setTextColor(TFT_WHITE, TFT_BLACK);
-    img.drawString(formatResistance(ValoresAC.resistance), rightCenterX, 58);
-
+    img.setTextColor(ValoresAC.valid ? TFT_WHITE : TFT_RED, TFT_BLACK);
+    img.setFreeFont(&FreeSans9pt7b);
+    img.drawString(ValoresAC.valid ? formatResistance(ValoresAC.resistance) : "SENSOR ERROR", rightCenterX, 58);
 
     // ==================== 4. TEMPERATURE BAR ====================
-    // Positioned cleanly in the middle (Y = 86, Height = 12)
-    drawTemperatureBar((int)ValoresMotor.temperature, 20, 86, 280, 12);
+    drawTemperatureBar((int)ValoresMotor.temperature, GAUGE_X, GAUGE_Y, GAUGE_W, GAUGE_H);
 
+    // ==================== 5. TREND STRIP ====================
+    // The arrow + 3s delta of both channels now live in their own band between
+    // the gauge bar and the status badge. That band is the space the slimmer
+    // badge hands over, and it is the only place the trend is now drawn.
+    img.fillRect(TREND_X, TREND_Y, TREND_W, TREND_H, TREND_BG);
+    img.drawRect(TREND_X, TREND_Y, TREND_W, TREND_H, TREND_LINE);
+    // The column divider continues through the band, so each chip reads as
+    // belonging to the column directly above it.
+    img.drawFastVLine(160, TREND_Y, TREND_H, TREND_LINE);
 
-    // ==================== 5. BOTTOM STATUS BANNER ====================
-    // Colored Status Badge Box (Y = 120 to 162)
+    int trendCenterY = TREND_Y + TREND_H / 2;
+    drawTrendChip(ValoresMotor, leftCenterX, trendCenterY, TFT_WHITE, TREND_BG);
+    drawTrendChip(ValoresAC, rightCenterX, trendCenterY, ValoresAC.valid ? TFT_WHITE : TFT_RED, TREND_BG);
+
+    // ==================== 6. BOTTOM STATUS BANNER ====================
+    // Slimmer badge (28px instead of 40px). The 12px it gives up is what pays
+    // for the trend strip above, which is why the band below stays a clean 6px.
     uint16_t statusBgColor = TFT_DARKGREEN;
     uint16_t statusTextColor = TFT_WHITE;
-    String statusText = "ESTATUS: NORMAL";
+    String statusText = "ESTADO: NORMAL";
 
-    if (ValoresMotor.temperature >= temp_threshold_warn && ValoresMotor.temperature < temp_threshold_overheat) {
+    if (ValoresMotor.temperature >= TEMP_WARNING) {
         statusBgColor = 0x8400; // Dark Yellow / Amber
         statusTextColor = TFT_BLACK;
-        statusText = "ESTATUS: CALENTADO";
-    } 
-    else if (ValoresMotor.temperature >= temp_threshold_overheat) {
-        statusBgColor = TFT_RED;
-        statusTextColor = TFT_WHITE;
-        statusText = "ESTATUS: SOBRECALENTADO";
+        statusText = "ESTADO: CALENTADO";
     }
 
     // Draw solid status badge
-    img.fillRoundRect(20, 120, 280, 40, 6, statusBgColor);
-    img.drawRoundRect(20, 120, 280, 40, 6, TFT_WHITE); // White border accent
+    img.fillRoundRect(BADGE_X, BADGE_Y, BADGE_W, BADGE_H, 6, statusBgColor);
+    img.drawRoundRect(BADGE_X, BADGE_Y, BADGE_W, BADGE_H, 6, TFT_WHITE); // White border accent
 
     // Render Status Text inside badge
     img.setTextDatum(MC_DATUM); // Middle-Center Alignment
     img.setTextColor(statusTextColor, statusBgColor);
     img.setFreeFont(&FreeSansBold9pt7b);
-    img.drawString(statusText, 160, 140);
+    img.drawString(statusText, 160, BADGE_Y + BADGE_H / 2);
 
     // Push frame to ST7789 display
     img.pushSprite(0, 0);
@@ -258,8 +351,8 @@ void drawTemperatureBar(int temp, int x, int y, int w, int h)
 
     // 4. Determine color
     uint16_t barColor = TFT_GREEN;
-    if (safeTemp >= 95 && safeTemp < 105) barColor = TFT_YELLOW;
-    if (safeTemp >= 105)                  barColor = TFT_ORANGE;
+    if (safeTemp >= TEMP_WARNING && safeTemp < TEMP_ALERT) barColor = TFT_YELLOW;
+    if (safeTemp >= TEMP_ALERT)                  barColor = TFT_ORANGE;
 
     // 5. Draw Outer Frame
     img.drawRect(x, y, w, h, TFT_WHITE); 
@@ -275,11 +368,16 @@ void drawTemperatureBar(int temp, int x, int y, int w, int h)
         img.fillRect(innerX + fillW, innerY, emptyW, innerH, TFT_BLACK);
     }
 
-    // 8. Add Scale Markers (Ticks drawn underneath, constrained inside w bounds)
+    // 8. Add scale marks, plus the two engine warning/alert markers.
     for (int i = 0; i <= 120; i += 30) {
         int markX = x + map(i, 0, 120, 0, w - 1); // w - 1 keeps tick 120 within bounds
         img.drawFastVLine(markX, y + h, 4, TFT_LIGHTGREY);
     }
+
+    int warningX = x + map(TEMP_WARNING, 0, 120, 0, w - 1);
+    int alertX = x + map(TEMP_ALERT, 0, 120, 0, w - 1);
+    img.drawFastVLine(warningX, y - 2, h + 6, TFT_WHITE);
+    img.drawFastVLine(alertX, y - 2, h + 6, TFT_WHITE);
 }
 
 void drawTrendIndicator(TempTrend trend, int x, int y, int s, uint16_t color) 
@@ -327,12 +425,44 @@ void drawTrendIndicator(TempTrend trend, int x, int y, int s, uint16_t color)
     }
 }
 
+// One trend read-out for the trend strip: the hand drawn arrow plus the 3s
+// delta, laid out as a single block optically centred on (centerX, centerY).
+// The block is measured rather than hardcoded, so a longer delta ("-12.3") or a
+// shorter one ("0.0") stays centred and never runs into the column divider.
+void drawTrendChip(const SensorData &data, int centerX, int centerY, uint16_t color, uint16_t bg)
+{
+    const int arrowSize = 16;
+    const int gap = 6;
+
+    // Set the font before measuring: textWidth() measures the active free font.
+    img.setFreeFont(&FreeSansBold9pt7b);
+    img.setTextColor(color, bg);
+    img.setTextDatum(MC_DATUM);
+
+    if (!data.valid) {
+        img.drawString("ERR", centerX, centerY);
+        return;
+    }
+
+    String delta = formatTrendDelta(data);
+    int blockW = arrowSize + gap + img.textWidth(delta);
+    int x = centerX - blockW / 2;
+
+    // With MC_DATUM a FreeSansBold9pt7b line occupies rows y-6 .. y+7, so
+    // centring the arrow on centerY lines it up with the digits' optical middle.
+    drawTrendIndicator(data.trend, x, centerY - arrowSize / 2, arrowSize, color);
+    img.drawString(delta, x + arrowSize + gap, centerY);
+}
+
 SensorData leer_termistor_ac() 
 {
-    SensorData datosAC;
+    SensorData datosAC = {};
     datosAC.resistance = -1;
     datosAC.temperature = -1;
-    static TrendTracker ACTrendTracker(3500, 0.60f);  // 3.5s window, 0.60°C threshold for trend detection
+    datosAC.temp_change_3s = 0.0f;
+    datosAC.trend = ESTABLE;
+    datosAC.valid = false;
+    static TrendTracker ACTrendTracker(3000, TREND_NOISE_THRESHOLD);  // 3s window
     // Valores Conocidos
     int Vin = 3329; 
     int R1 = 20000; 
@@ -372,22 +502,30 @@ SensorData leer_termistor_ac()
     {
         Lnr = logf(R3_final);
         InvT = A + (B * Lnr) + (C * Lnr * Lnr * Lnr);
-        datosAC.temperature = (1.0f / InvT) - 273.15f;
+        if (InvT != 0.0f) {
+            datosAC.temperature = (1.0f / InvT) - 273.15f;
+            datosAC.valid = true;
+        }
     } 
     // --- Serial Output para Debug ---
     // Serial.print("VOUT_Filt: "); Serial.print(Vout_filtrado); Serial.print(" mV | ");
     // Serial.print("R3: "); Serial.print(datosAC.resistance); Serial.print(" ohms | ");
     // Serial.print("Temp: "); Serial.print(datosAC.temperature); Serial.println(" °C");
-    ACTrendTracker.update(datosAC.temperature, datosAC.trend, datosAC.temp_change_3s);
+    if (datosAC.valid) {
+        ACTrendTracker.update(datosAC.temperature, datosAC.trend, datosAC.temp_change_3s);
+    }
     return datosAC;
 }
 
 SensorData leer_termistor_motor() 
 {
-    SensorData datosMotor;
+    SensorData datosMotor = {};
     datosMotor.resistance=-1;
     datosMotor.temperature=-1;
-    static TrendTracker motorTrendTracker(3500, 0.60f); ///3.5s window 0.60°C threshold for trend detection
+    datosMotor.temp_change_3s = 0.0f;
+    datosMotor.trend = ESTABLE;
+    datosMotor.valid = false;
+    static TrendTracker motorTrendTracker(3000, TREND_NOISE_THRESHOLD); // 3s window
     //Ecuacion Steinhart-Hart: 1/T = A + B * (ln(R)) + C(ln(R)^3 (Donde R es la Resistencia en Ohmios del Termisor(R2) y T la temperatura en Kelvin)   
     //Valores Conocidos
     const int Vin = 3329; const int R1 = 46850; long R2 = 0;
@@ -399,15 +537,6 @@ SensorData leer_termistor_motor()
     const int offset_calibracion = 0;
     const float alpha = 0.15; // Factor de suavizado (entre 0.01 y 1.0). Menor = más filtrado.
     static float Vout_filtrado = -1.0; //Static para que conserve su valor entre llamadas y permita el filtrado digital low-pass
-
-    //Buffer de Lecturas para calcular la tendencia de temperatura en los últimos 3.5 segundos
-    const unsigned long WINDOW_MS = 3500; // Target window: 3.5 seconds
-    const int BUFFER_SIZE = 20;            // Keeps up to 20 historical points
-    static float temp_history[BUFFER_SIZE];
-    static unsigned long time_history[BUFFER_SIZE];
-    static int head = 0;
-    static bool buffer_filled = false;
-
 
     // 1. Leer la muestra instantánea actual
     int Vout_inst = analogReadMilliVolts(0) - offset_calibracion;
@@ -428,10 +557,14 @@ SensorData leer_termistor_motor()
     if (R2 > 0) {
         float Lnr = logf((float)R2);
         float InvT = A + B * Lnr + C * Lnr * Lnr * Lnr;
-        
-        // Conversión a Celsius y ajuste por calibración (+3)
-        datosMotor.temperature = (1.0f / InvT) - 273.15f + 3.0f;
+        if (InvT != 0.0f) {
+            // Conversión a Celsius y ajuste por calibración (+3)
+            datosMotor.temperature = (1.0f / InvT) - 273.15f + 3.0f;
+            datosMotor.valid = true;
+        }
     } 
-    motorTrendTracker.update(datosMotor.temperature, datosMotor.trend, datosMotor.temp_change_3s);
+    if (datosMotor.valid) {
+        motorTrendTracker.update(datosMotor.temperature, datosMotor.trend, datosMotor.temp_change_3s);
+    }
     return datosMotor;
 }
