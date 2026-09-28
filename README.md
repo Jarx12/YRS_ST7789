@@ -5,7 +5,6 @@ Temperature monitor for an ESP32-C3 with an ST7789 LCD and two thermistor inputs
 ## Features
 
 - Displays engine and A/C temperatures and calculated resistances.
-- Shows a compact 3-second trend arrow and temperature delta for each channel.
 - Shows a 0–120 °C engine temperature bar with markers at 95 °C and 110 °C.
 - Shows a full-screen alert when the engine reaches 110 °C.
 - Keeps the alert active until the engine temperature falls to 105 °C or lower.
@@ -55,7 +54,7 @@ The serial monitor speed configured in `platformio.ini` is 115200 baud.
 
 ## Project layout
 
-- `src/YRS_ST7789.ino` — firmware, display layout, sensor conversion, filtering, trends, and alert state.
+- `src/YRS_ST7789.ino` — firmware, display layout, sensor conversion, filtering, and alert state.
 - `platformio.ini` — ESP32-C3 board, TFT_eSPI, display, and SPI settings.
 - `lib/TFT_eSPI-2.5.43/` — tracked TFT_eSPI library copy.
 - `Docs/` — pinout and thermistor calibration references.
