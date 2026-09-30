@@ -1,5 +1,14 @@
 ﻿#include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
+
+#if !__has_include("secrets.h")
+#error "include/secrets.h not found - copy include/secrets.h.example and set the credentials"
+#endif
+#include "secrets.h"
 
 TFT_eSPI tft = TFT_eSPI();
 TFT_eSprite img = TFT_eSprite(&tft); // Create the Sprite object
@@ -23,6 +32,17 @@ const unsigned long DISPLAY_PERIOD_MS = 100;
 // ==================== VIEW BUTTON (GPIO6, momentary) ====================
 const uint8_t BUTTON_PIN = 6;
 const unsigned long BUTTON_DEBOUNCE_MS = 30;
+
+// ==================== WIFI (credentials in include/secrets.h) ====================
+// Shown by the OTA page and the status endpoint, so a freshly flashed board can
+// be confirmed without a serial cable. Bump it whenever a new build is released.
+const char *FIRMWARE_VERSION = "1.1.0";
+
+// The join is deliberately non-blocking: the dashboard has to keep rendering
+// whether or not the access point is there, so WiFi is only ever polled and
+// retried from the background.
+const unsigned long WIFI_JOIN_TIMEOUT_MS = 15000; // one attempt before giving up
+const unsigned long WIFI_RETRY_MS = 5000;        // pause between attempts
 
 // ==================== DASHBOARD LAYOUT (320x172 landscape) ====================
 // The bottom half of the screen, top to bottom: gauge bar, then the status
@@ -277,6 +297,297 @@ public:
 ViewButton view_button;
 TempHistory temp_history;
 
+// ==================== WIFI STATE ====================
+// WiFi exists here only to serve the OTA endpoint; nothing on the dashboard
+// depends on it. The state machine is polled from loop() and never blocks, so an
+// absent or locked-out access point costs nothing but a retry timer.
+enum WifiState { WIFI_IDLE, WIFI_JOINING, WIFI_JOINED };
+
+WifiState wifi_state = WIFI_IDLE;
+unsigned long wifi_attempt_ms = 0; // when the current join started
+unsigned long wifi_retry_ms = 0;   // earliest time the next attempt may start
+
+// Latest reading of each channel, published to the HTTP status endpoint. Kept
+// out here because the endpoint can be read from any view, including the alert
+// screen, which returns before a view ever runs.
+SensorData last_motor;
+SensorData last_ac;
+
+void wifi_log(const char *message)
+{
+    Serial.print("[wifi] ");
+    Serial.println(message);
+}
+
+void wifi_start()
+{
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA); // station only: the OTA page is reached over the LAN
+    WiFi.setHostname(WIFI_HOSTNAME);
+    WiFi.setAutoReconnect(true);
+
+    wifi_retry_ms = 0; // the first attempt is due immediately
+    wifi_log("joining network...");
+}
+
+// Called from loop() on every pass. millis() is allowed to wrap, so elapsed
+// time is always measured on the subtraction and cast to a signed type.
+void wifi_poll()
+{
+    if (wifi_state == WIFI_JOINED) {
+        if (WiFi.status() != WL_CONNECTED) {
+            wifi_log("link lost, retrying soon");
+            wifi_state = WIFI_IDLE;
+            wifi_retry_ms = millis() + WIFI_RETRY_MS;
+        }
+        return;
+    }
+
+    if ((long)(millis() - wifi_retry_ms) < 0) {
+        return; // still inside the backoff window
+    }
+
+    if (wifi_state == WIFI_IDLE) {
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        wifi_state = WIFI_JOINING;
+        wifi_attempt_ms = millis();
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifi_state = WIFI_JOINED;
+        wifi_log("connected");
+        Serial.print("[wifi]   hostname: ");
+        Serial.println(WIFI_HOSTNAME);
+        Serial.print("[wifi]   ip:       ");
+        Serial.println(WiFi.localIP());
+        Serial.print("[wifi]   rssi:     ");
+        Serial.println(WiFi.RSSI());
+        Serial.print("[wifi]   ota page: http://");
+        Serial.print(WiFi.localIP());
+        Serial.println("/");
+        return;
+    }
+
+    if ((millis() - wifi_attempt_ms) > WIFI_JOIN_TIMEOUT_MS) {
+        wifi_log("join timed out");
+        wifi_state = WIFI_IDLE;
+        wifi_retry_ms = millis() + WIFI_RETRY_MS;
+    }
+}
+
+// ==================== HTTP OTA SERVER ====================
+// Accepts a firmware image over plain HTTP and writes it into the app slot the
+// bootloader is not currently running from. Every route sits behind HTTP Basic
+// auth, and the upload body itself is checked before a single byte of flash is
+// written - not just the request that announced it.
+WebServer ota_server(80);
+bool ota_upload_failed = false;
+String ota_result = "";
+
+// The upload is served synchronously, so it stops the display loop while it
+// runs. This screen is the only feedback the driver gets during that window.
+void draw_ota_screen(const char *headline, const char *detail, uint16_t color)
+{
+    img.fillSprite(TFT_BLACK);
+    img.setTextColor(color, TFT_BLACK);
+    img.setTextDatum(MC_DATUM);
+    img.setFreeFont(&FreeSansBold18pt7b);
+    img.drawString(headline, 160, 66);
+    img.setFreeFont(&FreeSans9pt7b);
+    img.drawString(detail, 160, 98);
+    img.drawString("NO CORTE LA ALIMENTACION", 160, 130);
+    img.pushSprite(0, 0);
+}
+
+bool ota_authorise()
+{
+    if (ota_server.authenticate(OTA_USER, OTA_PASS)) {
+        return true;
+    }
+    ota_server.requestAuthentication();
+    return false;
+}
+
+// Size of the slot the image goes into: the app partition that is not the
+// running one, which is exactly what the bootloader switches to on reset.
+size_t ota_target_size()
+{
+    const esp_partition_t *slot = esp_ota_get_next_update_partition(NULL);
+    return slot ? slot->size : 0;
+}
+
+String ota_info_json()
+{
+    String json = "{";
+    json += "\"device\":\"" + String(WIFI_HOSTNAME) + "\",";
+    json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"rssi_dbm\":" + String(WiFi.RSSI()) + ",";
+    json += "\"uptime_s\":" + String(millis() / 1000) + ",";
+    json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"sketch_free\":" + String(ESP.getFreeSketchSpace()) + ",";
+    json += "\"motor_c\":" + (last_motor.valid ? String(last_motor.temperature) : String("null")) + ",";
+    json += "\"motor_ohm\":" + (last_motor.valid ? String(last_motor.resistance) : String("null")) + ",";
+    json += "\"ac_c\":" + (last_ac.valid ? String(last_ac.temperature) : String("null")) + ",";
+    json += "\"ac_ohm\":" + (last_ac.valid ? String(last_ac.resistance) : String("null"));
+    json += "}";
+    return json;
+}
+
+void ota_handle_upload()
+{
+    HTTPUpload &upload = ota_server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        ota_upload_failed = false;
+        ota_result = "";
+
+        if (!ota_server.authenticate(OTA_USER, OTA_PASS)) {
+            ota_upload_failed = true;
+            ota_result = "Sin autorizacion";
+            return;
+        }
+        if (ota_target_size() == 0) {
+            ota_upload_failed = true;
+            ota_result = "No se encontro la particion OTA";
+            return;
+        }
+
+        Serial.println("[ota] upload started");
+        draw_ota_screen("ACTUALIZANDO", "Recibiendo firmware", TFT_CYAN);
+
+        if (!Update.begin(ota_target_size())) {
+            ota_upload_failed = true;
+            ota_result = String("No se pudo iniciar: ") + Update.errorString();
+        }
+        return;
+    }
+
+    // After a failure nothing else may reach the flash.
+    if (ota_upload_failed) {
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            ota_upload_failed = true;
+            ota_result = String("Error al escribir: ") + Update.errorString();
+        }
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+            ota_result = "OK";
+        } else {
+            ota_upload_failed = true;
+            ota_result = String("Error al finalizar: ") + Update.errorString();
+        }
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        ota_upload_failed = true;
+        ota_result = "Subida cancelada";
+    }
+}
+
+void ota_handle_upload_done()
+{
+    ota_server.sendHeader("Connection", "close");
+
+    if (ota_result == "OK") {
+        Serial.println("[ota] flash written, rebooting");
+        draw_ota_screen("ACTUALIZADO", "Reiniciando...", TFT_GREEN);
+        ota_server.send(200, "text/html",
+                        "<!DOCTYPE html><html><head><meta charset=utf-8></head><body style='background:#111;color:#4f4;font-family:sans-serif;text-align:center;padding:40px'>"
+                        "<h2>Firmware actualizado</h2><p>El equipo se reiniciara en unos segundos.</p></body></html>");
+        delay(500); // let the response reach the browser before the reset
+        ESP.restart();
+        return;
+    }
+
+    if (ota_result == "Sin autorizacion") {
+        ota_server.requestAuthentication(BASIC_AUTH, "YRS_ST7789 OTA", ota_result);
+        return;
+    }
+
+    String page = "<!DOCTYPE html><html><head><meta charset=utf-8></head><body style='background:#111;color:#f66;font-family:sans-serif;padding:24px'>"
+                  "<h2>No se pudo actualizar</h2><p>";
+    page += ota_result;
+    page += "</p><p><a style='color:#6cf' href='/'>Volver</a></p></body></html>";
+    ota_server.send(500, "text/html", page);
+}
+
+// Kept in flash rather than RAM: the 320x172 sprite already claims 110kB of a 320kB heap
+const char OTA_PAGE[] PROGMEM = R"html(
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YRS_ST7789 - Firmware</title>
+<style>
+body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:24px}
+h1{font-size:1.25rem}
+p{color:#aaa;font-size:.85rem;line-height:1.5}
+input,button{font-size:1rem;padding:10px;width:100%;box-sizing:border-box;margin-top:12px}
+button{background:#1565c0;color:#fff;border:0;border-radius:6px;cursor:pointer}
+a{color:#6cf}
+</style></head><body>
+<h1>Actualizar firmware</h1>
+<p>Sube el <code>firmware.bin</code> que genera <code>pio run</code>. La pantalla
+se congela mientras se escribe el flash y el equipo se reinicia al terminar.</p>
+<form method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="firmware" accept=".bin" required>
+<button type="submit">Subir firmware</button>
+</form>
+<p><a href="/info">Estado del dispositivo (JSON)</a></p>
+</body></html>
+)html";
+
+void ota_start()
+{
+    ota_server.on("/", HTTP_GET, []() {
+        if (!ota_authorise()) {
+            return;
+        }
+        ota_server.sendHeader("Connection", "close");
+        ota_server.send_P(200, "text/html", OTA_PAGE);
+    });
+
+    ota_server.on("/info", HTTP_GET, []() {
+        if (!ota_authorise()) {
+            return;
+        }
+        ota_server.sendHeader("Connection", "close");
+        ota_server.send(200, "application/json", ota_info_json());
+    });
+
+    // The length is not known up front, which is what lets a full size image
+    // stream straight into flash instead of being buffered in RAM first.
+    ota_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    ota_server.on("/update", HTTP_POST, ota_handle_upload_done, ota_handle_upload);
+
+    ota_server.onNotFound([]() {
+        if (!ota_authorise()) {
+            return;
+        }
+        ota_server.send(404, "text/plain", "Ruta no encontrada");
+    });
+
+    ota_server.begin();
+    Serial.println("[ota] server listening on port 80");
+}
+
+void ota_poll()
+{
+    // Servicing the socket is what actually moves an upload along, so this runs
+    // on every pass rather than on the throttled display tick.
+    ota_server.handleClient();
+}
+
 
 void setup() {
     tft.init();
@@ -296,10 +607,21 @@ void setup() {
             delay(1000);
         }
     }
+
+    // The dashboard is already up at this point, so networking starts last: a
+    // slow join costs nothing and can never delay the first frame.
+    wifi_start();
+    ota_start();
 }
 
 void loop()
 {
+    // WiFi and the OTA server run on every pass, not on the throttled display
+    // tick below: an upload in progress has to be serviced at full speed or the
+    // socket starts timing out.
+    wifi_poll();
+    ota_poll();
+
     //Polling view button: a press is latched until the contact is released
     if (view_button.consumePress()) {
         current_view = (DashboardView)((current_view + 1) % VIEW_COUNT);
@@ -318,6 +640,10 @@ void loop()
 void updateDisplay() {
     SensorData motor = motor_channel.read();
     SensorData ac    = ac_channel.read();
+
+    // Published for the HTTP status endpoint, which can be read from any view.
+    last_motor = motor;
+    last_ac = ac;
 
     // Log both channels on every tick, whichever dashboard is on screen. The
     // graph is one button press away at any moment, so its history has to be
