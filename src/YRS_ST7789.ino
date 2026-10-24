@@ -1,9 +1,10 @@
-﻿#include <Arduino.h>
+#include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
 
 #if !__has_include("secrets.h")
 #error "include/secrets.h not found - copy include/secrets.h.example and set the credentials"
@@ -322,12 +323,11 @@ void wifi_log(const char *message)
 void wifi_start()
 {
     Serial.begin(115200);
-    WiFi.mode(WIFI_STA); // station only: the OTA page is reached over the LAN
+    WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_MINUS_1dBm);
     WiFi.setHostname(WIFI_HOSTNAME);
     WiFi.setAutoReconnect(true);
-
     wifi_retry_ms = 0; // the first attempt is due immediately
-    wifi_log("joining network...");
 }
 
 // Called from loop() on every pass. millis() is allowed to wrap, so elapsed
@@ -590,6 +590,8 @@ void ota_poll()
 
 
 void setup() {
+    esp_task_wdt_init(10, true); // enable watchdog with 10s timeout, panic on timeout
+    esp_task_wdt_add(NULL);      // add the current (main) task to be watched
     tft.init();
     tft.setRotation(1); // Landscape 320x172
     tft.fillScreen(TFT_BLACK);
@@ -621,6 +623,7 @@ void loop()
     // socket starts timing out.
     wifi_poll();
     ota_poll();
+    esp_task_wdt_reset(); // reset watchdog timer
 
     //Polling view button: a press is latched until the contact is released
     if (view_button.consumePress()) {
